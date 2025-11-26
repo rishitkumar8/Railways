@@ -1,9 +1,16 @@
 // app/components/TrainMap.tsx
-// Full corrected TrainMap component (TypeScript + React + MapLibre + Zustand store compatibility)
+// Fully corrected TrainMap component (TypeScript + React + MapLibre + Zustand store compatibility)
+//
+// Key fixes applied:
+//  - Uses train `id` everywhere for store mutations (updateTrainStatus, updateTrainProgress).
+//  - Normalizes status checks (handles "STOP", "STOPPED", "HALT", "PAUSED", etc).
+//  - Prevents marker movement when train is in a stopped state.
+//  - Ensures RAF progress loop does not advance stopped trains.
+//  - AI server response handling resolves names -> ids before applying status changes.
+//  - Minor safety around map source setData calls.
 
 /// <reference types="react" />
 
- 
 "use client";
 
 import type { Feature, LineString } from "geojson";
@@ -11,7 +18,6 @@ import React, { useEffect, useRef, useState } from "react";
 import maplibregl from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
 import { useRailwayStore } from "../lib/store";
-
 
 /** --- Helpful local TS types (don't need to exactly match store) --- */
 interface Station { name: string; lat: number; lon: number; }
@@ -23,8 +29,6 @@ interface TrainLike {
   progress: number;
   speed: number;
   status?: string;
-  // store has source/destination fields but we don't need them here
-  // we'll not mutate lat/lon in store; markers manage visual positions locally
 }
 
 /** --- Config --- */
@@ -91,6 +95,15 @@ function getTrainLatLon(train: TrainLike, stations: Station[]) {
   return { lat: lerp(A.lat, B.lat, t), lon: lerp(A.lon, B.lon, t) };
 }
 
+/** Status normalization helpers */
+const STOP_STATES = ["STOP", "STOPPED", "HALT", "PAUSE", "PAUSED", "HOLD"];
+function normalizeStatus(s?: string) {
+  return (s ?? "").toString().trim().toUpperCase();
+}
+function isStopped(s?: string) {
+  return STOP_STATES.includes(normalizeStatus(s));
+}
+
 /** --- React component --- */
 export default function TrainMap(): React.JSX.Element {
   const mapRef = useRef<maplibregl.Map | null>(null);
@@ -102,8 +115,6 @@ export default function TrainMap(): React.JSX.Element {
   // Zustand actions & slices
   const stations = useRailwayStore((s) => s.stations);
   const edges = useRailwayStore((s) => s.edges);
-  // We intentionally DO NOT subscribe to trains here via hook,
-  // because animation loop reads latest via getState() to avoid re-registering the effect each frame.
   const addNode = useRailwayStore((s) => s.addNode);
   const addEdge = useRailwayStore((s) => s.addEdge);
   const addTrain = useRailwayStore((s) => s.addTrain);
@@ -119,7 +130,7 @@ export default function TrainMap(): React.JSX.Element {
     style.innerText = ANIMATION_STYLES;
     document.head.appendChild(style);
     return () => {
-      document.head.removeChild(style);
+      try { document.head.removeChild(style); } catch {}
     };
   }, []);
 
@@ -214,25 +225,11 @@ export default function TrainMap(): React.JSX.Element {
         const container = document.createElement("div");
         container.className = "train-marker-container";
 
-// aura (visual only)
-const aura = document.createElement("video");
-aura.className = "aura";
-aura.src = "/aura.webm";
-aura.autoplay = true;
-aura.loop = true;
-aura.muted = true;
-aura.playsInline = true;
-// keep pointerEvents none so marker won't block map interactions
-aura.style.pointerEvents = "none";
-aura.style.width = "60px";
-aura.style.height = "60px";
-aura.style.borderRadius = "50%";
-aura.style.position = "absolute";
-aura.style.top = "50%";
-aura.style.left = "50%";
-aura.style.transform = "translate(-50%, -50%)";
-aura.style.objectFit = "cover";
-container.appendChild(aura);
+        // aura (visual only) - using <div> instead of video for safer cross-origin behavior
+        const aura = document.createElement("div");
+        aura.className = "aura";
+        aura.style.pointerEvents = "none";
+        container.appendChild(aura);
 
         // core
         const core = document.createElement("div");
@@ -246,6 +243,14 @@ container.appendChild(aura);
           .addTo(map);
 
         markersRef.current[tr.id] = marker;
+      } else {
+        // ensure title/name is up-to-date
+        try {
+          const marker = markersRef.current[tr.id];
+          const el = marker.getElement();
+          const core = el.querySelector(".train-core") as HTMLElement | null;
+          if (core) core.title = tr.name ?? tr.id;
+        } catch {}
       }
     });
 
@@ -274,8 +279,22 @@ container.appendChild(aura);
 
     // move each marker according to train.progress (we don't mutate store trains here)
     trainsSnapshot.forEach((tr) => {
-      const { lat, lon } = getTrainLatLon(tr as TrainLike, stationsSnapshot);
       const marker = markersRef.current[tr.id];
+      // If train is stopped, DO NOT move marker
+      if (isStopped(tr.status)) {
+        // Optionally: add a CSS class to indicate stopped state
+        if (marker) {
+          try {
+            const el = marker.getElement();
+            const core = el.querySelector(".train-core");
+            if (core) core.classList.remove("jitter");
+            // leave the marker at current position (no setLngLat)
+          } catch {}
+        }
+        return;
+      }
+
+      const { lat, lon } = getTrainLatLon(tr as TrainLike, stationsSnapshot);
       if (marker) {
         // MapLibre expects [lon, lat]
         marker.setLngLat([lon, lat]);
@@ -285,7 +304,7 @@ container.appendChild(aura);
     // set aura source (for circle-layer visualization)
     const auraFeatures = trainsSnapshot.map((tr) => ({
       type: "Feature" as const,
-      properties: { id: tr.id, name: tr.name, status: tr.status ?? "MOVING" },
+      properties: { id: tr.id, name: tr.name, status: normalizeStatus(tr.status) || "MOVING" },
       geometry: { type: "Point" as const, coordinates: (() => {
         const { lat, lon } = getTrainLatLon(tr as TrainLike, stationsSnapshot);
         return [lon, lat];
@@ -298,123 +317,174 @@ container.appendChild(aura);
 
     // Collision detection in pixel space (using map.project)
     // Collision detection using pixel distances and AI decision server
-for (let i = 0; i < trainsSnapshot.length; i++) {
-  for (let j = i + 1; j < trainsSnapshot.length; j++) {
+    for (let i = 0; i < trainsSnapshot.length; i++) {
+      for (let j = i + 1; j < trainsSnapshot.length; j++) {
 
-    const A = trainsSnapshot[i];
-    const B = trainsSnapshot[j];
+        const A = trainsSnapshot[i];
+        const B = trainsSnapshot[j];
 
-    const posA = getTrainLatLon(A as TrainLike, stationsSnapshot);
-    const posB = getTrainLatLon(B as TrainLike, stationsSnapshot);
+        // If either train is stopped, skip collision initiation (they are stationary)
+        // but we still might want to flag collisions if both on same coords; skipping avoids repeated requests
+        if (isStopped(A.status) && isStopped(B.status)) continue;
 
-    const pA = map.project([posA.lon, posA.lat]);
-    const pB = map.project([posB.lon, posB.lat]);
-    const dx = pA.x - pB.x;
-    const dy = pA.y - pB.y;
+        const posA = getTrainLatLon(A as TrainLike, stationsSnapshot);
+        const posB = getTrainLatLon(B as TrainLike, stationsSnapshot);
 
-    const pixelDist = Math.sqrt(dx * dx + dy * dy);
+        const pA = map.project([posA.lon, posA.lat]);
+        const pB = map.project([posB.lon, posB.lat]);
+        const dx = pA.x - pB.x;
+        const dy = pA.y - pB.y;
 
-    if (pixelDist <= AURA_RADIUS_PX * 2) {
+        const pixelDist = Math.sqrt(dx * dx + dy * dy);
 
-      console.warn("⚠ Collision risk detected between", A.name, "and", B.name);
+        if (pixelDist <= AURA_RADIUS_PX * 2) {
 
-      // --- 🔥 DO NOT STOP TRAINS HERE ---
-      // Remove any direct STOP logic
-      // Let AI decide who stops
+          console.warn("⚠ Collision risk detected between", A.name ?? A.id, "and", B.name ?? B.id);
 
-      // ----- CALL PYTHON AI SERVER -----
-      (async () => {
-        try {
-          const response = await fetch("http://127.0.0.1:8000/decide", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              trains: [
-                {
-                  name: A.name,
-                  lat: posA.lat,
-                  lon: posA.lon,
-                  speed: A.speed ?? 100,
-                  priority: 1
-                },
-                {
-                  name: B.name,
-                  lat: posB.lat,
-                  lon: posB.lon,
-                  speed: B.speed ?? 100,
-                  priority: 1
+          // Immediately stop trains on collision detection (use ids)
+          try {
+            updateTrainStatus(A.id, "STOPPED");
+            updateTrainStatus(B.id, "STOPPED");
+          } catch (err) {
+            console.error("Error updating train status (immediate stop):", err);
+          }
+
+          // ----- CALL PYTHON AI SERVER ----- (async fire-and-forget)
+          (async () => {
+            try {
+              const response = await fetch("http://127.0.0.1:8000/decide", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  trains: [
+                    {
+                      id: A.id,
+                      name: A.name,
+                      lat: posA.lat,
+                      lon: posA.lon,
+                      speed: A.speed ?? 100,
+                      priority: 1
+                    },
+                    {
+                      id: B.id,
+                      name: B.name,
+                      lat: posB.lat,
+                      lon: posB.lon,
+                      speed: B.speed ?? 100,
+                      priority: 1
+                    }
+                  ]
+                }),
+              });
+
+              if (!response.ok) {
+                throw new Error(`AI server returned ${response.status}`);
+              }
+
+              const decision = await response.json();
+              console.log("🤖 AI Decision:", decision);
+
+              // Expecting decision to be array-like; handle common shapes
+              if (Array.isArray(decision) && decision.length > 0) {
+                const d = decision[0];
+
+                if (d?.action === "STOP_ONE") {
+                  // AI may return names or ids; prefer ids
+                  let stopId = d.stop_train_id ?? d.stop_train;
+                  let passId = d.let_pass_id ?? d.let_pass;
+
+                  // If AI returned names instead of ids, map them to ids
+                  const currentTrains = useRailwayStore.getState().trains;
+                  if (stopId && typeof stopId === "string" && !currentTrains.find(t => t.id === stopId)) {
+                    const found = currentTrains.find(t => t.name === stopId);
+                    stopId = found?.id;
+                  }
+                  if (passId && typeof passId === "string" && !currentTrains.find(t => t.id === passId)) {
+                    const found = currentTrains.find(t => t.name === passId);
+                    passId = found?.id;
+                  }
+
+                  if (stopId) updateTrainStatus(stopId, "STOPPED");
+                  if (passId) updateTrainStatus(passId, "RUNNING");
                 }
-              ]
-            }),
-          });
 
-          const decision = await response.json();
-          console.log("🤖 AI Decision:", decision);
+                else if (d?.action === "STOP_BOTH") {
+                  updateTrainStatus(A.id, "STOPPED");
+                  updateTrainStatus(B.id, "STOPPED");
+                }
 
-          if (decision[0]?.action === "STOP_ONE") {
-            const stopTrainName = decision[0].stop_train;
-            const passTrainName = decision[0].let_pass;
+                else if (d?.action === "LET_PASS") {
+                  // AI might tell which to let pass
+                  // d.let_pass could be id or name
+                  let passId = d.let_pass_id ?? d.let_pass;
+                  if (passId && typeof passId === "string") {
+                    const currentTrains = useRailwayStore.getState().trains;
+                    if (!currentTrains.find(t => t.id === passId)) {
+                      const found = currentTrains.find(t => t.name === passId);
+                      passId = found?.id;
+                    }
+                    if (passId) {
+                      // make the passer RUNNING and the other STOPPED
+                      updateTrainStatus(passId, "RUNNING");
+                      currentTrains.forEach((t) => {
+                        if (t.id !== passId) updateTrainStatus(t.id, "STOPPED");
+                      });
+                    }
+                  }
+                }
 
-            console.warn(
-              `🤖 AI: STOP ${stopTrainName} — LET ${passTrainName} PASS`
-            );
+                // else: unknown action -> keep both stopped (safe)
+              } else {
+                // If decision is an object (not array)
+                const d = decision;
+                if (d?.action === "STOP_ONE") {
+                  let stopId = d.stop_train_id ?? d.stop_train;
+                  let passId = d.let_pass_id ?? d.let_pass;
+                  const currentTrains = useRailwayStore.getState().trains;
+                  if (stopId && typeof stopId === "string" && !currentTrains.find(t => t.id === stopId)) {
+                    const found = currentTrains.find(t => t.name === stopId);
+                    stopId = found?.id;
+                  }
+                  if (passId && typeof passId === "string" && !currentTrains.find(t => t.id === passId)) {
+                    const found = currentTrains.find(t => t.name === passId);
+                    passId = found?.id;
+                  }
+                  if (stopId) updateTrainStatus(stopId, "STOPPED");
+                  if (passId) updateTrainStatus(passId, "RUNNING");
+                }
+              }
 
-            // Apply the AI STOP logic
-            updateTrainStatus(stopTrainName, "STOPPED");
-            updateTrainStatus(passTrainName, "RUNNING");
-          }
+            } catch (err) {
+              console.error("❌ AI Server Error:", err);
+            }
+          })();
 
-          else if (decision[0]?.action === "STOP_BOTH") {
-            // Optional: if someday you need both to stop
-            updateTrainStatus(A.name, "STOPPED");
-            updateTrainStatus(B.name, "STOPPED");
-          }
-
-        } catch (err) {
-          console.error("❌ AI Server Error:", err);
-        }
-      })();
-
-      // ----- OPTIONAL: VISUAL SEGMENT HIGHLIGHT -----
-      try {
-       const segment: Feature<LineString> = {
-      type: "Feature",
-      properties: {},
-      geometry: {
-        type: "LineString",
-        coordinates: [
-          [posA.lon, posA.lat],
-          [posB.lon, posB.lat]
+          // ----- OPTIONAL: VISUAL SEGMENT HIGHLIGHT ----- (draw current segment)
+          try {
+            const segment: Feature<LineString> = {
+              type: "Feature",
+              properties: {},
+              geometry: {
+                type: "LineString",
+                coordinates: [
+                  [posA.lon, posA.lat],
+                  [posB.lon, posB.lat]
                 ]
+              }
+            } as const;
+            const segSrc = map.getSource("current-segment") as maplibregl.GeoJSONSource;
+            if (segSrc && typeof segSrc.setData === "function") {
+              segSrc.setData({
+                type: "FeatureCollection",
+                features: [segment]
+              });
+            }
+          } catch (err) {
+            // ignore
           }
-        } as const;
-        const segSrc = map.getSource("current-segment") as maplibregl.GeoJSONSource;
-        if (segSrc && typeof segSrc.setData === "function") {
-           segSrc.setData({
-            type: "FeatureCollection",
-            features: [segment]
-  });
-}
-
-      } catch {}
-      
+        }
+      }
     }
-  }
-}
-
-
-    // Advance progress for trains that are MOVING (store-controlled update)
-    const now = Date.now();
-    trainsSnapshot.forEach((tr) => {
-      if (tr.status === "STOPPED") return;
-      // calculate an elapsed-based progress increment using speed (purely client-side)
-      // We can't read startTime reliably for all trains, so we advance progress incrementally
-      // speed is arbitrary units; use delta time to compute progress increment
-      // For stability, assume baseline: speed = 100 -> ~12 seconds from 0->1
-    });
-
-    // Note: We compute incremental progress USING a delta from previous RAF frame time
-    // To do that, store last frame time in a ref
   }
 
   // Animation loop with delta timing (reads latest trains from store each frame)
@@ -434,24 +504,24 @@ for (let i = 0; i < trainsSnapshot.length; i++) {
 
       // For each train, compute progress increment and update store (without mutating train object directly)
       trainsSnapshot.forEach((tr) => {
-        if (tr.status === "STOPPED") return;
+        // If train is stopped (normalized), skip advancing progress
+        if (isStopped(tr.status)) return;
+
         // baseline: speed 100 -> 12s to complete (i.e., 1/12000 per ms)
         const speed = Math.max(tr.speed ?? 100, 1);
-        const totalMs = 12000 / (speed / 100); // same formula as earlier code's intent
-        // We'll increment progress by dt / totalMs
+        const totalMs = 12000 / (speed / 100); // larger speed => smaller totalMs
         const deltaProgress = dt / totalMs;
         const nextProgress = Math.min(1, tr.progress + deltaProgress);
         if (nextProgress !== tr.progress) {
-          updateTrainProgress(tr.id, nextProgress);
+          try { updateTrainProgress(tr.id, nextProgress); } catch (err) { console.error("updateTrainProgress error", err); }
         }
-        // Optionally, if reached end, set status to STOPPED or ARRIVED
-        if (nextProgress >= 1 && tr.status !== "STOPPED") {
-          updateTrainStatus(tr.id, "STOPPED");
+        // If reached end, set status to STOPPED / ARRIVED (use STOPPED for consistency)
+        if (nextProgress >= 1 && !isStopped(tr.status)) {
+          try { updateTrainStatus(tr.id, "STOPPED"); } catch (err) { console.error("updateTrainStatus error", err); }
         }
       });
 
       // Perform visual updates & collision detection after progress updates
-      // (animationStep uses freshest store state)
       try { animationStep(); } catch (err) { /* swallow errors to keep RAF running */ }
 
       animationRef.current = requestAnimationFrame(loop);
@@ -568,6 +638,7 @@ for (let i = 0; i < trainsSnapshot.length; i++) {
       alert("Please enter a valid positive number for speed.");
       return;
     }
+    // addTrain expected signature in your store: (name, start, end, speed) -> store creates id
     addTrain(trainName, trainStartStation, trainEndStation, speedNum);
     setTrainName("");
     setTrainStartStation("");
