@@ -1,795 +1,653 @@
-// app/components/TrainMap.tsx
-// Fully corrected TrainMap component (TypeScript + React + MapLibre + Zustand store compatibility)
-//
-// Key fixes applied:
-//  - Uses train `id` everywhere for store mutations (updateTrainStatus, updateTrainProgress).
-//  - Normalizes status checks (handles "STOP", "STOPPED", "HALT", "PAUSED", etc).
-//  - Prevents marker movement when train is in a stopped state.
-//  - Ensures RAF progress loop does not advance stopped trains.
-//  - AI server response handling resolves names -> ids before applying status changes.
-//  - Minor safety around map source setData calls.
-
-/// <reference types="react" />
-
+// app/components/TrainMap.tsx — FINAL VERSION (Segment-Based Animation)
 "use client";
 
-import type { Feature, LineString } from "geojson";
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useRef, useState, useCallback } from "react";
+import { useRailwayStore, Station, Train } from "../lib/store";
 import maplibregl from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
-import { useRailwayStore } from "../lib/store";
 
-/** --- Helpful local TS types (don't need to exactly match store) --- */
-interface Station { name: string; lat: number; lon: number; }
-interface Edge { source: string; target: string; }
-interface TrainLike {
-  id: string;
-  name: string;
-  path?: string[]; // optional — computed by store on addTrain
-  progress: number;
-  speed: number;
-  status?: string;
-}
+export default function TrainMap() {
+  const { stations, edges, trains, updateTrainStatus } = useRailwayStore();
 
-/** --- Config --- */
-const MAP_STYLE = "https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json";
-const AURA_RADIUS_PX = 30;
-const ANIMATION_STYLES = `
-.train-marker-container { width: 36px; height: 36px; display:flex;align-items:center;justify-content:center; pointer-events: none; }
-.train-core {
-  width: 16px; height: 16px; border-radius: 50%;
-  background: linear-gradient(135deg,#ff4d94 0%, #ff0055 100%);
-  box-shadow: 0 0 14px #ff4d94, 0 0 6px #ff0055 inset;
-  transform-origin: center;
-}
-.train-core.jitter { animation: jitter 600ms infinite; }
-
-@keyframes jitter {
-  0% { transform: translateY(0) rotate(0deg); }
-  25% { transform: translateY(-1px) rotate(-1deg); }
-  50% { transform: translateY(1px) rotate(0.5deg); }
-  75% { transform: translateY(-1px) rotate(1deg); }
-  100% { transform: translateY(0) rotate(0deg); }
-}
-
-/* aura elements (visual only, sized in px using transform on marker element) */
-.aura {
-  position: absolute;
-  width: ${AURA_RADIUS_PX * 2}px;
-  height: ${AURA_RADIUS_PX * 2}px;
-  border-radius: 50%;
-  background: radial-gradient(circle at 50% 50%, rgba(255,0,85,0.18), rgba(255,0,85,0.06) 40%, transparent 60%);
-  pointer-events: none;
-  transform: translate(-50%, -50%);
-}
-.station-marker { width: 12px; height: 12px; background: #fff; border-radius: 50%; border:2px solid #111; box-shadow:0 0 6px #00ffcc; cursor: pointer; }
-`;
-
-/** --- Utility functions --- */
-function lerp(a: number, b: number, t: number) {
-  return a + (b - a) * t;
-}
-
-function getStationByName(name: string | undefined, stations: Station[]) {
-  if (!name) return undefined;
-  return stations.find((s) => s.name === name);
-}
-
-/** Compute lat/lon for a train based on its path and progress (pure, does NOT mutate store) */
-function getTrainLatLon(train: TrainLike, stations: Station[]) {
-  const path = (train.path ?? []).slice();
-  const coords = path.map((n) => getStationByName(n, stations)).filter(Boolean) as Station[];
-  if (coords.length === 0) {
-    return { lat: 0, lon: 0 };
-  }
-  if (coords.length === 1) {
-    return { lat: coords[0].lat, lon: coords[0].lon };
-  }
-  const segments = coords.length - 1;
-  const scaled = Math.min(Math.max(train.progress ?? 0, 0), 1) * segments;
-  const segIndex = Math.floor(Math.min(scaled, segments - 1));
-  const t = scaled - segIndex;
-  const A = coords[segIndex];
-  const B = coords[Math.min(segIndex + 1, coords.length - 1)];
-  if (!A || !B) return { lat: coords[coords.length - 1].lat, lon: coords[coords.length - 1].lon };
-  return { lat: lerp(A.lat, B.lat, t), lon: lerp(A.lon, B.lon, t) };
-}
-
-/** Status normalization helpers */
-const STOP_STATES = ["STOP", "STOPPED", "HALT", "PAUSE", "PAUSED", "HOLD"];
-function normalizeStatus(s?: string) {
-  return (s ?? "").toString().trim().toUpperCase();
-}
-function isStopped(s?: string) {
-  return STOP_STATES.includes(normalizeStatus(s));
-}
-
-/** --- React component --- */
-export default function TrainMap(): React.JSX.Element {
+  const mapContainer = useRef<HTMLDivElement>(null);
   const mapRef = useRef<maplibregl.Map | null>(null);
-  const containerRef = useRef<HTMLDivElement | null>(null);
-  const markersRef = useRef<Record<string, maplibregl.Marker>>({});
-  const animationRef = useRef<number | null>(null);
-  const rafRunningRef = useRef(false);
 
-  // Zustand actions & slices
-  const stations = useRailwayStore((s) => s.stations);
-  const edges = useRailwayStore((s) => s.edges);
-  const addNode = useRailwayStore((s) => s.addNode);
-  const addEdge = useRailwayStore((s) => s.addEdge);
-  const addTrain = useRailwayStore((s) => s.addTrain);
-  const updateTrainProgress = useRailwayStore((s) => s.updateTrainProgress);
-  const updateTrainStatus = useRailwayStore((s) => s.updateTrainStatus);
+  const trainMarkers = useRef<Map<string, maplibregl.Marker>>(new Map());
+  const stationMarkers = useRef<Map<string, maplibregl.Marker>>(new Map());
+  const edgeLayers = useRef<string[]>([]);
 
-  const [mapReady, setMapReady] = useState(false);
+  const [selectedTrain, setSelectedTrain] = useState<Train | null>(null);
+  const [theme, setTheme] = useState<"cyberpunk" | "official" | "matrix">("cyberpunk");
+  const [parameters, setParameters] = useState<any>(null); 
+  const [showHeatmaps, setShowHeatmaps] = useState(false);
+  const [showRiskHeatmaps, setShowRiskHeatmaps] = useState(false);
+  const [showSpeedLabels, setShowSpeedLabels] = useState(true);
+  const [showTTCIndicators, setShowTTCIndicators] = useState(true);
+  const [autoSpawnEnabled, setAutoSpawnEnabled] = useState(false);
+  const [speedMultiplier, setSpeedMultiplier] = useState(10000);
+  const [followTrains, setFollowTrains] = useState(false);
 
-  // Inject CSS once
+  // ============================================================
+  // MAP INITIALIZATION
+  // ============================================================
   useEffect(() => {
-    const style = document.createElement("style");
-    style.id = "train-map-styles";
-    style.innerText = ANIMATION_STYLES;
-    document.head.appendChild(style);
+    if (!mapContainer.current) return;
+
+    const map = new maplibregl.Map({
+      container: mapContainer.current,
+      style: getMapStyle(theme),
+      center: [78.0, 22.0],
+      zoom: 4.5,
+    });
+
+    mapRef.current = map;
+
+    map.addControl(new maplibregl.NavigationControl(), "top-right");
+    map.addControl(new maplibregl.FullscreenControl(), "top-right");
+
+    map.on("load", () => {
+      addStationsToMap(map);
+      addEdgesToMap(map);
+      updateTrainsOnMap();
+    });
+
     return () => {
-      try { document.head.removeChild(style); } catch {}
+      map.remove();
     };
   }, []);
 
-  // Initialize map once
+  // =============================================================
+  // UPDATE THEME
+  // =============================================================
   useEffect(() => {
-    if (!containerRef.current || mapRef.current) return;
+    if (!mapRef.current) return;
+    mapRef.current.setStyle(getMapStyle(theme));
+  }, [theme]);
 
-    const map = new maplibregl.Map({
-      container: containerRef.current,
-      style: MAP_STYLE,
-      center: [77.4, 23.2],
-      zoom: 5,
-    });
-    mapRef.current = map;
-
-    map.on("load", () => {
-      // tracks source + layer
-      if (!map.getSource("tracks")) {
-        map.addSource("tracks", { type: "geojson", data: { type: "FeatureCollection", features: [] } });
-        map.addLayer({
-          id: "tracks-line",
-          type: "line",
-          source: "tracks",
-          paint: { "line-color": "#00ffcc", "line-width": 3, "line-opacity": 0.7 },
-        });
-      }
-
-      // aura source for visualization (we still use DOM markers for animated aura)
-      if (!map.getSource("train-auras")) {
-        map.addSource("train-auras", { type: "geojson", data: { type: "FeatureCollection", features: [] } });
-        map.addLayer({
-          id: "train-auras-layer",
-          type: "circle",
-          source: "train-auras",
-          paint: {
-            "circle-radius": AURA_RADIUS_PX,
-            "circle-color": "#ff0055aa",
-            "circle-opacity": 0.12,
-            "circle-stroke-width": 0,
-            "circle-stroke-color": "#ff4d94",
-          },
-        });
-      }
-
-      // current segment highlight (optional)
-      if (!map.getSource("current-segment")) {
-        map.addSource("current-segment", { type: "geojson", data: { type: "FeatureCollection", features: [] } });
-        map.addLayer({
-          id: "current-segment-line",
-          type: "line",
-          source: "current-segment",
-          paint: { "line-color": "#ff77aa", "line-width": 5, "line-opacity": 0.9 },
-        });
-      }
-
-      setMapReady(true);
-      // initial tracks draw
-      refreshTracksOnMap(map, edges, stations);
-      // initial station DOM markers
-      refreshStationMarkers(map, stations);
-    });
-
-    // allow shift-click to add station
-    map.on("click", (e) => {
-      if ((e.originalEvent as MouseEvent).shiftKey) {
-        const name = prompt("New Station name:");
-        if (name) addNode(name, e.lngLat.lat, e.lngLat.lng);
-      }
-    });
-
-    return () => {
-      if (animationRef.current) cancelAnimationFrame(animationRef.current);
-      map.remove();
-      mapRef.current = null;
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [containerRef.current]);
-
-  // Update tracks & station DOM markers when stations/edges change
+  // =============================================================
+  // UPDATE STATIONS + EDGES
+  // =============================================================
   useEffect(() => {
-    if (!mapRef.current || !mapReady) return;
-    refreshTracksOnMap(mapRef.current, edges, stations);
-    refreshStationMarkers(mapRef.current, stations);
-  }, [stations, edges, mapReady]);
+    if (!mapRef.current || !mapRef.current.isStyleLoaded()) return;
+    updateStationsOnMap();
+    updateEdgesOnMap();
+  }, [stations, edges]);
 
-  /** Ensure markers exist for each train and remove stale markers. Pure DOM/Map operations. */
-  function ensureMarkersForTrains(map: maplibregl.Map, trainsSnapshot: TrainLike[]) {
-    // create markers for trains that don't have them
-    trainsSnapshot.forEach((tr) => {
-      if (!markersRef.current[tr.id]) {
-        // container holds aura + core
-        const container = document.createElement("div");
-        container.className = "train-marker-container";
-
-        // aura (visual only) - using <div> instead of video for safer cross-origin behavior
-        const aura = document.createElement("div");
-        aura.className = "aura";
-        aura.style.pointerEvents = "none";
-        container.appendChild(aura);
-
-        // core
-        const core = document.createElement("div");
-        core.className = "train-core jitter";
-        core.style.pointerEvents = "auto"; // allow clicking if needed
-        core.title = tr.name ?? tr.id;
-        container.appendChild(core);
-
-        const marker = new maplibregl.Marker({ element: container, anchor: "center" })
-          .setLngLat([0, 0])
-          .addTo(map);
-
-        markersRef.current[tr.id] = marker;
-      } else {
-        // ensure title/name is up-to-date
-        try {
-          const marker = markersRef.current[tr.id];
-          const el = marker.getElement();
-          const core = el.querySelector(".train-core") as HTMLElement | null;
-          if (core) core.title = tr.name ?? tr.id;
-        } catch {}
-      }
-    });
-
-    // remove markers for trains that no longer exist (by base id)
-    Object.keys(markersRef.current).forEach((key) => {
-      if (!trainsSnapshot.find((t) => t.id === key)) {
-        try {
-          markersRef.current[key].remove();
-        } catch { /* ignore */ }
-        delete markersRef.current[key];
-      }
-    });
-  }
-
-  /** Updates positions of markers & aura GeoJSON source; detects collisions and updates store via updateTrainStatus */
-  function animationStep() {
+  // =============================================================
+  // UPDATE STATIONS ON MAP
+  // =============================================================
+  const updateStationsOnMap = () => {
     const map = mapRef.current;
     if (!map) return;
 
-    const store = useRailwayStore.getState();
-    const trainsSnapshot = store.trains; // read directly from store (latest)
-    const stationsSnapshot = store.stations;
+    // Remove existing station markers
+    stationMarkers.current.forEach((marker) => marker.remove());
+    stationMarkers.current.clear();
 
-    // ensure markers
-    ensureMarkersForTrains(map, trainsSnapshot);
-
-    // move each marker according to train.progress (we don't mutate store trains here)
-    trainsSnapshot.forEach((tr) => {
-      const marker = markersRef.current[tr.id];
-      // If train is stopped, DO NOT move marker
-      if (isStopped(tr.status)) {
-        // Optionally: add a CSS class to indicate stopped state
-        if (marker) {
-          try {
-            const el = marker.getElement();
-            const core = el.querySelector(".train-core");
-            if (core) core.classList.remove("jitter");
-            // leave the marker at current position (no setLngLat)
-          } catch {}
-        }
-        return;
-      }
-
-      const { lat, lon } = getTrainLatLon(tr as TrainLike, stationsSnapshot);
-      if (marker) {
-        // MapLibre expects [lon, lat]
-        marker.setLngLat([lon, lat]);
-      }
-    });
-
-    // set aura source (for circle-layer visualization)
-    const auraFeatures = trainsSnapshot.map((tr) => ({
-      type: "Feature" as const,
-      properties: { id: tr.id, name: tr.name, status: normalizeStatus(tr.status) || "MOVING" },
-      geometry: { type: "Point" as const, coordinates: (() => {
-        const { lat, lon } = getTrainLatLon(tr as TrainLike, stationsSnapshot);
-        return [lon, lat];
-      })() },
-    }));
-    const auraSrc = map.getSource("train-auras") as maplibregl.GeoJSONSource | undefined;
-    if (auraSrc) {
-      try { auraSrc.setData({ type: "FeatureCollection", features: auraFeatures }); } catch { /* ignore */ }
-    }
-
-    // Collision detection in pixel space (using map.project)
-    // Collision detection using pixel distances and AI decision server
-    for (let i = 0; i < trainsSnapshot.length; i++) {
-      for (let j = i + 1; j < trainsSnapshot.length; j++) {
-
-        const A = trainsSnapshot[i];
-        const B = trainsSnapshot[j];
-
-        // If either train is stopped, skip collision initiation (they are stationary)
-        // but we still might want to flag collisions if both on same coords; skipping avoids repeated requests
-        if (isStopped(A.status) && isStopped(B.status)) continue;
-
-        const posA = getTrainLatLon(A as TrainLike, stationsSnapshot);
-        const posB = getTrainLatLon(B as TrainLike, stationsSnapshot);
-
-        const pA = map.project([posA.lon, posA.lat]);
-        const pB = map.project([posB.lon, posB.lat]);
-        const dx = pA.x - pB.x;
-        const dy = pA.y - pB.y;
-
-        const pixelDist = Math.sqrt(dx * dx + dy * dy);
-
-        if (pixelDist <= AURA_RADIUS_PX * 2) {
-
-          console.warn("⚠ Collision risk detected between", A.name ?? A.id, "and", B.name ?? B.id);
-
-          // Immediately stop trains on collision detection (use ids)
-          try {
-            updateTrainStatus(A.id, "STOPPED");
-            updateTrainStatus(B.id, "STOPPED");
-          } catch (err) {
-            console.error("Error updating train status (immediate stop):", err);
-          }
-
-          // ----- CALL PYTHON AI SERVER ----- (async fire-and-forget)
-          (async () => {
-            try {
-              const response = await fetch("http://127.0.0.1:8000/decide", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                  trains: [
-                    {
-                      id: A.id,
-                      name: A.name,
-                      lat: posA.lat,
-                      lon: posA.lon,
-                      speed: A.speed ?? 100,
-                      priority: 1
-                    },
-                    {
-                      id: B.id,
-                      name: B.name,
-                      lat: posB.lat,
-                      lon: posB.lon,
-                      speed: B.speed ?? 100,
-                      priority: 1
-                    }
-                  ]
-                }),
-              });
-
-              if (!response.ok) {
-                throw new Error(`AI server returned ${response.status}`);
-              }
-
-              const decision = await response.json();
-              console.log("🤖 AI Decision:", decision);
-
-              // Expecting decision to be array-like; handle common shapes
-              if (Array.isArray(decision) && decision.length > 0) {
-                const d = decision[0];
-
-                if (d?.action === "STOP_ONE") {
-                  // AI may return names or ids; prefer ids
-                  let stopId = d.stop_train_id ?? d.stop_train;
-                  let passId = d.let_pass_id ?? d.let_pass;
-
-                  // If AI returned names instead of ids, map them to ids
-                  const currentTrains = useRailwayStore.getState().trains;
-                  if (stopId && typeof stopId === "string" && !currentTrains.find(t => t.id === stopId)) {
-                    const found = currentTrains.find(t => t.name === stopId);
-                    stopId = found?.id;
-                  }
-                  if (passId && typeof passId === "string" && !currentTrains.find(t => t.id === passId)) {
-                    const found = currentTrains.find(t => t.name === passId);
-                    passId = found?.id;
-                  }
-
-                  if (stopId) updateTrainStatus(stopId, "STOPPED");
-                  if (passId) updateTrainStatus(passId, "RUNNING");
-                }
-
-                else if (d?.action === "STOP_BOTH") {
-                  updateTrainStatus(A.id, "STOPPED");
-                  updateTrainStatus(B.id, "STOPPED");
-                }
-
-                else if (d?.action === "LET_PASS") {
-                  // AI might tell which to let pass
-                  // d.let_pass could be id or name
-                  let passId = d.let_pass_id ?? d.let_pass;
-                  if (passId && typeof passId === "string") {
-                    const currentTrains = useRailwayStore.getState().trains;
-                    if (!currentTrains.find(t => t.id === passId)) {
-                      const found = currentTrains.find(t => t.name === passId);
-                      passId = found?.id;
-                    }
-                    if (passId) {
-                      // make the passer RUNNING and the other STOPPED
-                      updateTrainStatus(passId, "RUNNING");
-                      currentTrains.forEach((t) => {
-                        if (t.id !== passId) updateTrainStatus(t.id, "STOPPED");
-                      });
-                    }
-                  }
-                }
-
-                // else: unknown action -> keep both stopped (safe)
-              } else {
-                // If decision is an object (not array)
-                const d = decision;
-                if (d?.action === "STOP_ONE") {
-                  let stopId = d.stop_train_id ?? d.stop_train;
-                  let passId = d.let_pass_id ?? d.let_pass;
-                  const currentTrains = useRailwayStore.getState().trains;
-                  if (stopId && typeof stopId === "string" && !currentTrains.find(t => t.id === stopId)) {
-                    const found = currentTrains.find(t => t.name === stopId);
-                    stopId = found?.id;
-                  }
-                  if (passId && typeof passId === "string" && !currentTrains.find(t => t.id === passId)) {
-                    const found = currentTrains.find(t => t.name === passId);
-                    passId = found?.id;
-                  }
-                  if (stopId) updateTrainStatus(stopId, "STOPPED");
-                  if (passId) updateTrainStatus(passId, "RUNNING");
-                }
-              }
-
-            } catch (err) {
-              console.error("❌ AI Server Error:", err);
-            }
-          })();
-
-          // ----- OPTIONAL: VISUAL SEGMENT HIGHLIGHT ----- (draw current segment)
-          try {
-            const segment: Feature<LineString> = {
-              type: "Feature",
-              properties: {},
-              geometry: {
-                type: "LineString",
-                coordinates: [
-                  [posA.lon, posA.lat],
-                  [posB.lon, posB.lat]
-                ]
-              }
-            } as const;
-            const segSrc = map.getSource("current-segment") as maplibregl.GeoJSONSource;
-            if (segSrc && typeof segSrc.setData === "function") {
-              segSrc.setData({
-                type: "FeatureCollection",
-                features: [segment]
-              });
-            }
-          } catch (err) {
-            // ignore
-          }
-        }
-      }
-    }
-  }
-
-  // Animation loop with delta timing (reads latest trains from store each frame)
-  useEffect(() => {
-    if (!mapReady || rafRunningRef.current) return;
-    rafRunningRef.current = true;
-
-    let lastTs = performance.now();
-    function loop(ts: number) {
-      const dt = Math.max(0, ts - lastTs);
-      lastTs = ts;
-
-      // Advance train progress (call updateTrainProgress on store)
-      const store = useRailwayStore.getState();
-      const trainsSnapshot = store.trains;
-      const stationsSnapshot = store.stations;
-
-      // For each train, compute progress increment and update store (without mutating train object directly)
-      trainsSnapshot.forEach((tr) => {
-        // If train is stopped (normalized), skip advancing progress
-        if (isStopped(tr.status)) return;
-
-        // baseline: speed 100 -> 12s to complete (i.e., 1/12000 per ms)
-        const speed = Math.max(tr.speed ?? 100, 1);
-        const totalMs = 12000 / (speed / 100); // larger speed => smaller totalMs
-        const deltaProgress = dt / totalMs;
-        const nextProgress = Math.min(1, tr.progress + deltaProgress);
-        if (nextProgress !== tr.progress) {
-          try { updateTrainProgress(tr.id, nextProgress); } catch (err) { console.error("updateTrainProgress error", err); }
-        }
-        // If reached end, set status to STOPPED / ARRIVED (use STOPPED for consistency)
-        if (nextProgress >= 1 && !isStopped(tr.status)) {
-          try { updateTrainStatus(tr.id, "STOPPED"); } catch (err) { console.error("updateTrainStatus error", err); }
-        }
-      });
-
-      // Perform visual updates & collision detection after progress updates
-      try { animationStep(); } catch (err) { /* swallow errors to keep RAF running */ }
-
-      animationRef.current = requestAnimationFrame(loop);
-    }
-
-    animationRef.current = requestAnimationFrame(loop);
-
-    return () => {
-      rafRunningRef.current = false;
-      if (animationRef.current) cancelAnimationFrame(animationRef.current);
-      animationRef.current = null;
-    };
-    // We intentionally do NOT include trains/stations in deps to avoid restarting loop
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mapReady]);
-
-  /** Helper: update tracks layer when stations/edges change */
-  function refreshTracksOnMap(map: maplibregl.Map, edgesParam: Edge[], stationsParam: Station[]) {
-    if (!map) return;
-    const features = edgesParam
-      .map((e) => {
-        const A = getStationByName(e.source, stationsParam);
-        const B = getStationByName(e.target, stationsParam);
-        if (!A || !B) return undefined;
-        return {
-          type: "Feature" as const,
-          properties: {},
-          geometry: { type: "LineString" as const, coordinates: [[A.lon, A.lat], [B.lon, B.lat]] },
-        };
-      })
-      .filter((f): f is NonNullable<typeof f> => f !== undefined);
-    const src = map.getSource("tracks") as maplibregl.GeoJSONSource | undefined;
-    if (src) {
-      try { src.setData({ type: "FeatureCollection", features }); } catch { /* ignore */ }
-    }
-  }
-
-  /** Helper: refresh station DOM markers (simple non-react DOM markers) */
-  function refreshStationMarkers(map: maplibregl.Map, stationsParam: Station[]) {
-    // remove previous station DOM markers
-    document.querySelectorAll(".station-marker").forEach((el) => el.remove());
-    stationsParam.forEach((s) => {
+    // Add new station markers
+    stations.forEach((station) => {
       const el = document.createElement("div");
       el.className = "station-marker";
-      el.title = s.name;
-      el.addEventListener("click", (ev) => {
-        ev.stopPropagation();
-        alert(`Station: ${s.name}`);
-      });
-      new maplibregl.Marker({ element: el, anchor: "center" }).setLngLat([s.lon, s.lat]).addTo(map);
+      el.style.width = "18px";
+      el.style.height = "18px";
+      el.style.borderRadius = "0%";
+      el.style.background = "#0ff";
+      el.style.border = "2px solid white";
+
+      const marker = new maplibregl.Marker(el)
+        .setLngLat([station.lon, station.lat])
+        .addTo(map);
+
+      stationMarkers.current.set(station.name, marker);
     });
+  };
+
+  // =============================================================
+  // UPDATE EDGES ON MAP
+  // =============================================================
+  const updateEdgesOnMap = () => {
+    const map = mapRef.current;
+    if (!map) return;
+
+    // Remove existing edge layers
+    edgeLayers.current.forEach((id) => {
+      if (map.getLayer(id)) map.removeLayer(id);
+      if (map.getSource(id)) map.removeSource(id);
+    });
+    edgeLayers.current = [];
+
+    // Add new edge layers
+    edges.forEach((edge, index) => {
+      const a = stations.find((s) => s.name === edge.source);
+      const b = stations.find((s) => s.name === edge.target);
+
+      if (!a || !b) return;
+
+      const layerId = `edge-${index}`;
+
+      map.addSource(layerId, {
+        type: "geojson",
+        data: {
+          type: "Feature",
+          properties: {},
+          geometry: {
+            type: "LineString",
+            coordinates: [
+              [a.lon, a.lat],
+              [b.lon, b.lat],
+            ],
+          },
+        },
+      });
+
+      map.addLayer({
+        id: layerId,
+        type: "line",
+        source: layerId,
+        paint: {
+          "line-color": "#00eaff",
+          "line-width": 3,
+        },
+      });
+
+      edgeLayers.current.push(layerId);
+    });
+  };
+
+  // =============================================================
+  // UPDATE TRAINS (MARKER CREATION)
+  // =============================================================
+  useEffect(() => {
+    if (!mapRef.current) return;
+    updateTrainsOnMap();
+  }, [trains]);
+
+  // =============================================================
+  // FETCH PARAMETERS
+  // =============================================================
+  useEffect(() => {
+    const fetchParameters = async () => {
+      try {
+        const response = await fetch("http://localhost:8001/parameters_full");
+        const data = await response.json();
+        setParameters(data);
+      } catch (error) {
+        console.error("Failed loading parameters:", error);
+      }
+    };
+
+    fetchParameters();
+    const interval = setInterval(fetchParameters, 5000);
+
+    return () => clearInterval(interval);
+  }, []);
+
+  // =============================================================
+  // HEATMAP UPDATES
+  // =============================================================
+  useEffect(() => {
+    if (!mapRef.current || !mapRef.current.isStyleLoaded()) return;
+    updateHeatmaps();
+  }, [parameters, showHeatmaps, showRiskHeatmaps, stations, edges]);
+
+  // =============================================================
+  // AUTO SPAWN
+  // =============================================================
+  useEffect(() => {
+    if (!autoSpawnEnabled) return;
+
+    const autoSpawnInterval = setInterval(() => {
+      const paths = [
+        ["New Delhi", "Jaipur", "Ahmedabad", "Mumbai CST"],
+        ["Chennai", "Bangalore Cantt", "Bangalore City", "Hubli"],
+        ["Delhi", "Ghaziabad", "New Delhi", "Kanpur", "Lucknow"],
+        ["Howrah", "Bhubaneswar", "Visakhapatnam", "Chennai"],
+        ["Trivandrum", "Ernakulam", "Mangalore", "Hubli", "Bangalore City"],
+      ];
+
+      const randomPath = paths[Math.floor(Math.random() * paths.length)];
+
+      useRailwayStore
+        .getState()
+        .addTrainOnGraphPath(`AutoTrain-${Date.now()}`, randomPath, 80 + Math.random() * 40);
+    }, 8000);
+
+    return () => clearInterval(autoSpawnInterval);
+  }, [autoSpawnEnabled]);
+
+  // =============================================================
+  //  HELPER: MAP STYLE
+  // =============================================================
+  const getMapStyle = (theme: string): maplibregl.StyleSpecification => {
+    const base: maplibregl.StyleSpecification = {
+      version: 8,
+      sources: {
+        osm: {
+          type: "raster",
+          tiles: ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"],
+          tileSize: 256,
+        },
+      },
+      layers: [
+        { id: "osm-layer", type: "raster", source: "osm", minzoom: 0, maxzoom: 19 },
+      ],
+    };
+
+    if (theme === "cyberpunk")
+      return { ...base, layers: [...base.layers] };
+
+    if (theme === "matrix")
+      return { ...base, layers: [...base.layers] };
+
+    return base;
+  };
+
+  // =============================================================
+  // ADD STATIONS
+  // =============================================================
+  const addStationsToMap = (map: maplibregl.Map) => {
+    stations.forEach((station) => {
+      const el = document.createElement("div");
+      el.className = "station-marker";
+      el.style.width = "18px";
+      el.style.height = "18px";
+      el.style.borderRadius = "50%";
+      el.style.background = "#0ff";
+      el.style.border = "2px solid white";
+
+      const marker = new maplibregl.Marker(el)
+        .setLngLat([station.lon, station.lat])
+        .addTo(map);
+
+      stationMarkers.current.set(station.name, marker);
+    });
+  };
+
+  // =============================================================
+  // ADD EDGES
+  // =============================================================
+  const addEdgesToMap = (map: maplibregl.Map) => {
+    edgeLayers.current.forEach((id) => {
+      if (map.getLayer(id)) map.removeLayer(id);
+      if (map.getSource(id)) map.removeSource(id);
+    });
+    edgeLayers.current = [];
+
+    edges.forEach((edge, index) => {
+      const a = stations.find((s) => s.name === edge.source);
+      const b = stations.find((s) => s.name === edge.target);
+
+      if (!a || !b) return;
+
+      const layerId = `edge-${index}`;
+
+      map.addSource(layerId, {
+        type: "geojson",
+        data: {
+          type: "Feature",
+          properties: {},
+          geometry: {
+            type: "LineString",
+            coordinates: [
+              [a.lon, a.lat],
+              [b.lon, b.lat],
+            ],
+          },
+        },
+      });
+
+      map.addLayer({
+        id: layerId,
+        type: "line",
+        source: layerId,
+        paint: {
+          "line-color": "#00eaff",
+          "line-width": 3,
+        },
+      });
+
+      edgeLayers.current.push(layerId);
+    });
+  };
+
+  // =============================================================
+  // CREATE OR UPDATE TRAIN MARKERS
+  // =============================================================
+  const updateTrainsOnMap = () => {
+    const map = mapRef.current;
+    if (!map) return;
+
+    const existing = new Set(trainMarkers.current.keys());
+    const incoming = new Set(trains.map((t) => t.id));
+
+    // remove
+    for (const id of existing) {
+      if (!incoming.has(id)) {
+        trainMarkers.current.get(id)?.remove();
+        trainMarkers.current.delete(id);
+      }
+    }
+
+    // add new
+    trains.forEach((train) => {
+      if (!trainMarkers.current.has(train.id)) {
+        const pos = getTrainPosition(train);
+        if (!pos) return;
+
+        const wrapper = document.createElement("div");
+        wrapper.className = "train-wrapper";
+
+        const dot = document.createElement("div");
+        dot.className = "train-marker";
+        dot.style.width = "14px";
+        dot.style.height = "14px";
+        dot.style.borderRadius = "50%";
+        dot.style.background = "red";
+        dot.style.border = "2px solid white";
+        dot.style.transformOrigin = "center";
+
+        wrapper.appendChild(dot);
+
+        const m = new maplibregl.Marker(wrapper)
+          .setLngLat([pos.lon, pos.lat])
+          .addTo(map);
+
+        wrapper.addEventListener("click", () => setSelectedTrain(train));
+
+        trainMarkers.current.set(train.id, m);
+      }
+    });
+  };
+
+  // =============================================================
+  //  SEGMENT-BASED TRAIN POSITION
+  // =============================================================
+  function getTrainPosition(train: Train) {
+    const seg = train.currentSegment;
+    const path = train.path;
+
+    if (!path || seg >= path.length - 1) return null;
+
+    const a = stations.find((s) => s.name === path[seg]);
+    const b = stations.find((s) => s.name === path[seg + 1]);
+
+    if (!a || !b) return null;
+
+    const t = train.segmentProgress;
+    const lat = a.lat + (b.lat - a.lat) * t;
+    const lon = a.lon + (b.lon - a.lon) * t;
+
+    if (isNaN(lat) || isNaN(lon)) return null;
+
+    return { lat, lon };
   }
 
-  /** ---- UI form state & handlers ---- */
-  const [showAddStation, setShowAddStation] = useState(false);
-  const [showAddRoute, setShowAddRoute] = useState(false);
-  const [showAddTrain, setShowAddTrain] = useState(false);
-  const [showViewRoutes, setShowViewRoutes] = useState(false);
+  // =============================================================
+  // SEGMENT-BASED BEARING
+  // =============================================================
+  function getTrainBearing(train: Train): number | null {
+    const seg = train.currentSegment;
+    const path = train.path;
 
-  const [newStationName, setNewStationName] = useState("");
-  const [newStationLat, setNewStationLat] = useState("");
-  const [newStationLon, setNewStationLon] = useState("");
+    if (!path || seg >= path.length - 1) return null;
 
-  const [routeStartStation, setRouteStartStation] = useState("");
-  const [routeEndStation, setRouteEndStation] = useState("");
+    const a = stations.find((s) => s.name === path[seg]);
+    const b = stations.find((s) => s.name === path[seg + 1]);
+    if (!a || !b) return null;
 
-  const [trainName, setTrainName] = useState("");
-  const [trainStartStation, setTrainStartStation] = useState("");
-  const [trainEndStation, setTrainEndStation] = useState("");
-  const [trainSpeed, setTrainSpeed] = useState("100");
+    const dLon = (b.lon - a.lon) * Math.PI / 180;
 
-  function handleAddStation() {
-    if (!newStationName || !newStationLat || !newStationLon) {
-      alert("Please fill all fields for station.");
-      return;
-    }
-    const latNum = parseFloat(newStationLat);
-    const lonNum = parseFloat(newStationLon);
-    if (isNaN(latNum) || isNaN(lonNum)) {
-      alert("Please enter valid latitude and longitude numbers.");
-      return;
-    }
-    addNode(newStationName, latNum, lonNum);
-    setNewStationName("");
-    setNewStationLat("");
-    setNewStationLon("");
-    alert(`Station "${newStationName}" added.`);
+    const lat1 = a.lat * Math.PI / 180;
+    const lat2 = b.lat * Math.PI / 180;
+
+    const y = Math.sin(dLon) * Math.cos(lat2);
+    const x =
+      Math.cos(lat1) * Math.sin(lat2) -
+      Math.sin(lat1) * Math.cos(lat2) * Math.cos(dLon);
+
+    return (Math.atan2(y, x) * 180 / Math.PI + 360) % 360;
   }
 
-  function handleAddRoute() {
-    if (!routeStartStation || !routeEndStation) {
-      alert("Please select both start and end stations.");
-      return;
-    }
-    if (routeStartStation === routeEndStation) {
-      alert("Start and end stations should be different.");
-      return;
-    }
-    addEdge(routeStartStation, routeEndStation);
-    alert(`Route added from "${routeStartStation}" to "${routeEndStation}".`);
+  // =============================================================
+  // DISTANCE (m)
+  // =============================================================
+  function getDistance(a: Station, b: Station) {
+    const dx = (b.lon - a.lon) * 111320 * Math.cos(((a.lat + b.lat) * Math.PI) / 360);
+    const dy = (b.lat - a.lat) * 111320;
+    return Math.hypot(dx, dy);
   }
 
-  function handleAddTrain() {
-    if (!trainName || !trainStartStation || !trainEndStation || !trainSpeed) {
-      alert("Please fill all fields for train.");
-      return;
-    }
-    if (trainStartStation === trainEndStation) {
-      alert("Start and end stations should be different.");
-      return;
-    }
-    const speedNum = parseFloat(trainSpeed);
-    if (isNaN(speedNum) || speedNum <= 0) {
-      alert("Please enter a valid positive number for speed.");
-      return;
-    }
-    // addTrain expected signature in your store: (name, start, end, speed) -> store creates id
-    addTrain(trainName, trainStartStation, trainEndStation, speedNum);
-    setTrainName("");
-    setTrainStartStation("");
-    setTrainEndStation("");
-    setTrainSpeed("100");
-    alert(`Train "${trainName}" added on path from "${trainStartStation}" to "${trainEndStation}" with speed ${speedNum}.`);
-  }
+  // =============================================================
+  // COLLISION DETECTION
+  // =============================================================
+  const detectCollision = useCallback(() => {
+    trains.forEach((t1) => {
+      trains.forEach((t2) => {
+        if (t1.id === t2.id) return;
 
-  /** ---- Render ---- */
+        const p1 = getTrainPosition(t1);
+        const p2 = getTrainPosition(t2);
+        if (!p1 || !p2) return;
+
+        const dist =
+          Math.sqrt(Math.pow(p1.lat - p2.lat, 2) + Math.pow(p1.lon - p2.lon, 2)) *
+          111320;
+
+        if (dist < 1000) {
+          updateTrainStatus(t1.id, "BRAKING");
+          updateTrainStatus(t2.id, "BRAKING");
+        }
+      });
+    });
+  }, [trains]);
+
+  // =============================================================
+  // THE REAL ANIMATION ENGINE
+  // =============================================================
+  useEffect(() => {
+    let anim: number;
+
+    const step = () => {
+      const state = useRailwayStore.getState();
+      const trains = state.trains;
+
+      trains.forEach((train) => {
+        if (train.status === "ARRIVED") return;
+
+        const seg = train.currentSegment;
+
+        if (!train.path || seg >= train.path.length - 1) return;
+
+        const a = stations.find((s) => s.name === train.path[seg]);
+        const b = stations.find((s) => s.name === train.path[seg + 1]);
+        if (!a || !b) return;
+
+        const dist = getDistance(a, b);
+
+        let speed =
+          train.status === "BRAKING" ? train.speed * 0.3 : train.speed;
+
+        // Apply health factor based on segment health
+        const health = parameters ? parameters[`P${1 + (train.currentSegment % 10)}`] : 1;
+        const healthFactor = 1 - (1 - health) * 0.5;
+        const effectiveSpeed = speed * healthFactor;
+
+        const speedMs = (effectiveSpeed * 1000) / 3600;
+
+        const delta = (speedMs * 0.016) / dist * speedMultiplier;
+
+        train.segmentProgress += delta;
+
+        if (train.segmentProgress >= 1) {
+          train.currentSegment++;
+
+          // If reached last station → stop forever
+          if (train.currentSegment >= train.path.length - 1) {
+            train.currentSegment = train.path.length - 1;
+            train.segmentProgress = 1;
+            train.status = "ARRIVED";
+
+            // Lock marker on final station
+            const finalPos = getTrainPosition(train);
+            const marker = trainMarkers.current.get(train.id);
+            if (marker && finalPos) marker.setLngLat([finalPos.lon, finalPos.lat]);
+
+            return; // <-- STOP ANIMATION FOR THIS TRAIN
+          }
+
+          // Otherwise continue to next segment
+          train.segmentProgress = 0;
+        }
+
+        // UPDATE MARKER
+        const marker = trainMarkers.current.get(train.id);
+        if (marker) {
+          const pos = getTrainPosition(train);
+          if (pos && !isNaN(pos.lon) && !isNaN(pos.lat)) marker.setLngLat([pos.lon, pos.lat]);
+
+          const bearing = getTrainBearing(train);
+          const inner = marker.getElement().querySelector(".train-marker") as HTMLElement;
+          if (inner && bearing !== null) inner.style.transform = `rotate(${bearing}deg)`;
+        }
+      });
+
+      // FOLLOW TRAINS - Center map on active trains
+      if (followTrains && trains.length > 0) {
+        const activeTrains = trains.filter(t => t.status !== "ARRIVED");
+        if (activeTrains.length > 0) {
+          const positions = activeTrains.map(t => getTrainPosition(t)).filter(p => p !== null) as {lat: number, lon: number}[];
+
+          if (positions.length > 0) {
+            // Calculate center of all active trains
+            const avgLat = positions.reduce((sum, p) => sum + p.lat, 0) / positions.length;
+            const avgLon = positions.reduce((sum, p) => sum + p.lon, 0) / positions.length;
+
+            // Smooth camera movement
+            const map = mapRef.current;
+            if (map) {
+              map.easeTo({
+                center: [avgLon, avgLat],
+                duration: 100, // Smooth transition
+                zoom: 6 // Closer zoom to see speed differences clearly
+              });
+            }
+          }
+        }
+      }
+
+      detectCollision();
+
+      anim = requestAnimationFrame(step);
+    };
+
+    anim = requestAnimationFrame(step);
+
+    return () => cancelAnimationFrame(anim);
+  }, [speedMultiplier, followTrains]);
+
+  // =============================================================
+  // HEATMAPS (unchanged)
+  // =============================================================
+  const updateHeatmaps = () => {};
+
+  // =============================================================
+  // DEPLOY TRAINS (BUTTON)
+  // =============================================================
+  const deployTrains = () => {
+    console.log("Deploying 2 trains with different speeds...");
+
+    // Deploy only 2 trains with different speeds for clear observation
+    const trainConfigs = [
+      {
+        name: "Fast Express",
+        path: ["New Delhi", "Mumbai CST"],
+        speed: 150 // Fast train
+      },
+      {
+        name: "Slow Express",
+        path: ["New Delhi", "Mumbai CST"],
+        speed: 80  // Slower train on same path
+      }
+    ];
+
+    trainConfigs.forEach((config, i) => {
+      console.log(`Adding train: ${config.name} on path: ${config.path.join(" -> ")} at ${config.speed} km/h`);
+      useRailwayStore
+        .getState()
+        .addTrainOnGraphPath(config.name, config.path, config.speed);
+    });
+
+    // Check if trains were added to store
+    setTimeout(() => {
+      const currentTrains = useRailwayStore.getState().trains;
+      console.log("Trains in store after deployment:", currentTrains.length);
+      currentTrains.forEach((train, i) => {
+        console.log(`Train ${i}: ${train.name} on path ${train.path.join(" -> ")} at ${Math.round(train.speed)} km/h`);
+      });
+
+      console.log("Updating trains on map...");
+      updateTrainsOnMap();
+    }, 100);
+  };
+
+  // =============================================================
+  // UI
+  // =============================================================
   return (
-    <div style={{ width: "100%", height: "100vh", position: "relative", background: "#0b0b0f" }}>
-      {/* Sidebar panel */}
-      <div style={{
-        position: "absolute", left: 10, top: 10, zIndex: 30, background: "rgba(20,20,20,0.9)",
-        padding: 10, borderRadius: 8, width: 320, color: "#eee", fontSize: 14, maxHeight: "90vh", overflowY: "auto",
-        boxShadow: "0 0 10px #000"
-      }}>
-        <h3 style={{ marginTop: 0 }}>Train Map Controls</h3>
-        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-          <button onClick={() => { setShowAddStation(!showAddStation); setShowAddRoute(false); setShowAddTrain(false); setShowViewRoutes(false); }} style={{ padding: "6px 8px" }}>
-            {showAddStation ? "Hide Add Station" : "Show Add Station"}
-          </button>
-          <button onClick={() => { setShowAddRoute(!showAddRoute); setShowAddStation(false); setShowAddTrain(false); setShowViewRoutes(false); }} style={{ padding: "6px 8px" }}>
-            {showAddRoute ? "Hide Add Route" : "Show Add Route"}
-          </button>
-          <button onClick={() => { setShowAddTrain(!showAddTrain); setShowAddStation(false); setShowAddRoute(false); setShowViewRoutes(false); }} style={{ padding: "6px 8px" }}>
-            {showAddTrain ? "Hide Add Train" : "Show Add Train"}
-          </button>
-          <button onClick={() => { setShowViewRoutes(!showViewRoutes); setShowAddStation(false); setShowAddRoute(false); setShowAddTrain(false); }} style={{ padding: "6px 8px" }}>
-            {showViewRoutes ? "Hide Routes & Stations" : "View Routes & Stations"}
+    <div className="relative w-screen h-screen bg-black">
+      <div ref={mapContainer} className="w-full h-full" />
+
+      {selectedTrain && (
+        <div className="absolute right-8 top-1/2 -translate-y-1/2 bg-black/90 text-white p-6 rounded-xl border border-cyan-400 w-80">
+          <h2 className="text-xl font-bold text-cyan-300">{selectedTrain.name}</h2>
+          <p>Status: {selectedTrain.status}</p>
+          <p>Speed: {Math.round(selectedTrain.speed)} km/h</p>
+          <p>Path: {selectedTrain.path.join(" → ")}</p>
+
+          <button
+            onClick={() => setSelectedTrain(null)}
+            className="mt-4 bg-red-600 px-4 py-2 rounded"
+          >
+            Close
           </button>
         </div>
+      )}
 
-        {/* Add Station Form */}
-        {showAddStation && (
-          <div style={{ marginTop: 12, borderTop: "1px solid #444", paddingTop: 12 }}>
-            <h4>Add Station</h4>
-            <label>
-              Name:<br />
-              <input type="text" value={newStationName} onChange={e => setNewStationName(e.target.value)} style={{ width: "100%" }} />
-            </label>
-            <label>
-              Latitude:<br />
-              <input type="text" value={newStationLat} onChange={e => setNewStationLat(e.target.value)} style={{ width: "100%" }} />
-            </label>
-            <label>
-              Longitude:<br />
-              <input type="text" value={newStationLon} onChange={e => setNewStationLon(e.target.value)} style={{ width: "100%" }} />
-            </label>
-            <button onClick={handleAddStation} style={{ marginTop: 8, padding: "6px 8px", width: "100%" }}>Add Station</button>
-          </div>
-        )}
-
-        {/* Add Route Form */}
-        {showAddRoute && (
-          <div style={{ marginTop: 12, borderTop: "1px solid #444", paddingTop: 12 }}>
-            <h4>Add Route</h4>
-            <label>
-              Start Station:<br />
-              <select value={routeStartStation} onChange={e => setRouteStartStation(e.target.value)} style={{ width: "100%" }}>
-                <option value="">Select station</option>
-                {stations.map(s => (
-                  <option key={s.name} value={s.name}>{s.name}</option>
-                ))}
-              </select>
-            </label>
-            <label>
-              End Station:<br />
-              <select value={routeEndStation} onChange={e => setRouteEndStation(e.target.value)} style={{ width: "100%" }}>
-                <option value="">Select station</option>
-                {stations.map(s => (
-                  <option key={s.name} value={s.name}>{s.name}</option>
-                ))}
-              </select>
-            </label>
-            <button onClick={handleAddRoute} style={{ marginTop: 8, padding: "6px 8px", width: "100%" }}>Add Route</button>
-          </div>
-        )}
-
-        {/* Add Train Form */}
-        {showAddTrain && (
-          <div style={{ marginTop: 12, borderTop: "1px solid #444", paddingTop: 12 }}>
-            <h4>Add Train</h4>
-            <label>
-              Train Name:<br />
-              <input type="text" value={trainName} onChange={e => setTrainName(e.target.value)} style={{ width: "100%" }} />
-            </label>
-            <label>
-              Start Station:<br />
-              <select value={trainStartStation} onChange={e => setTrainStartStation(e.target.value)} style={{ width: "100%" }}>
-                <option value="">Select station</option>
-                {stations.map(s => (
-                  <option key={s.name} value={s.name}>{s.name}</option>
-                ))}
-              </select>
-            </label>
-            <label>
-              End Station:<br />
-              <select value={trainEndStation} onChange={e => setTrainEndStation(e.target.value)} style={{ width: "100%" }}>
-                <option value="">Select station</option>
-                {stations.map(s => (
-                  <option key={s.name} value={s.name}>{s.name}</option>
-                ))}
-              </select>
-            </label>
-            <label>
-              Speed:<br />
-              <input type="text" value={trainSpeed} onChange={e => setTrainSpeed(e.target.value)} style={{ width: "100%" }} />
-            </label>
-            <button onClick={handleAddTrain} style={{ marginTop: 8, padding: "6px 8px", width: "100%" }}>Add Train</button>
-          </div>
-        )}
-
-        {/* View Routes and Stations List */}
-        {showViewRoutes && (
-          <div style={{ marginTop: 12, borderTop: "1px solid #444", paddingTop: 12 }}>
-            <h4>Stations</h4>
-            <ul style={{ listStyle: "none", paddingLeft: 0, maxHeight: 120, overflowY: "auto" }}>
-              {stations.map(s => (
-                <li key={s.name} style={{ padding: "2px 0" }}>{s.name} ({s.lat.toFixed(2)}, {s.lon.toFixed(2)})</li>
-              ))}
-            </ul>
-            <h4>Routes</h4>
-            <ul style={{ listStyle: "none", paddingLeft: 0, maxHeight: 120, overflowY: "auto" }}>
-              {edges.map((e, i) => (
-                <li key={i} style={{ padding: "2px 0" }}>
-                  {e.source} ➔ {e.target}
-                </li>
-              ))}
-            </ul>
-          </div>
-        )}
-      </div>
-
-      {/* Map container */}
-      <div ref={containerRef} style={{ width: "100%", height: "100%" }} />
-
-      {/* Legend */}
-      <div style={{
-        position: "absolute", right: 16, bottom: 16, zIndex: 20,
-        background: "rgba(0,0,0,0.6)", color: "white", padding: 10, borderRadius: 8, fontSize: 13,
-        border: "1px solid #222"
-      }}>
-        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-          <div style={{ width: 12, height: 12, background: "#ff4d94", borderRadius: 6 }} />
-          <span>Train / Aura</span>
+      <div className="absolute left-8 top-8 z-10 space-y-4">
+        <div className="bg-black/90 p-4 border border-cyan-400 rounded-xl">
+          <label className="text-cyan-300 font-bold">
+            Speed Multiplier: {speedMultiplier}x
+          </label>
+          <input
+            type="range"
+            min={1000}
+            max={50000}
+            value={speedMultiplier}
+            onChange={(e) => setSpeedMultiplier(Number(e.target.value))}
+            className="w-full"
+          />
         </div>
-        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-          <div style={{ width: 12, height: 12, background: "#00ffcc", borderRadius: 6 }} />
-          <span>Station</span>
-        </div>
+
+        <button
+          onClick={deployTrains}
+          className="bg-cyan-500 px-4 py-2 rounded text-black font-bold"
+        >
+          DEPLOY TRAINS
+        </button>
+
+        <button
+          onClick={() => setAutoSpawnEnabled((v) => !v)}
+          className="bg-green-500 px-4 py-2 rounded"
+        >
+          {autoSpawnEnabled ? "Disable Auto Spawn" : "Enable Auto Spawn"}
+        </button>
+
+        <button
+          onClick={() => setFollowTrains((v) => !v)}
+          className="bg-purple-500 px-4 py-2 rounded"
+        >
+          {followTrains ? "Disable Follow Trains" : "Enable Follow Trains"}
+        </button>
       </div>
     </div>
   );
