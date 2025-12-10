@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # TODO: Implement Phase B - 100-meter Track Segmentation Engine
 
 ## Completed: Implement Track Parameters (P21-P40)
@@ -34,3 +35,14 @@
 - Test `/decide` endpoint to ensure station and segment env are generated.
 - Test `/compute140` to verify parameters use env data.
 - Update frontend to display env data if needed.
+=======
+# Fix Stale Closure in TrainMap Animation
+
+## Tasks
+- [x] Fix animation useEffect to read fresh trains and stations from store inside animate function
+- [x] Update getTrainPosition to read fresh stations from store
+- [x] Optimize updateTrainsOnMap to only add/remove markers as needed instead of recreating all
+- [x] Remove trains and stations from animation useEffect dependencies
+- [x] Test animation with multiple trains to ensure updates work
+- [x] Verify performance improvements with marker management
+>>>>>>> 42b56fc74ed4d9318fd8a98b55c9f9214c9b0ffd

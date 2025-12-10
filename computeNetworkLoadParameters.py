@@ -153,7 +153,11 @@ def compute_network_load_parameters(
         # ----------------------------------------------
         # P53 — Network entropy (path diversity)
         # ----------------------------------------------
+<<<<<<< HEAD
         unique_stations = len({t["source"] for t in trains})
+=======
+        unique_stations = len({t.get("source") for t in trains if t.get("source")})
+>>>>>>> 42b56fc74ed4d9318fd8a98b55c9f9214c9b0ffd
         p53 = min(1.0, unique_stations / max(1, len(stations)))
 
         # ----------------------------------------------
